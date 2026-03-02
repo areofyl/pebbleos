@@ -11,4 +11,18 @@ void print(const char *s) {
   }
 }
 
-void main() { print("Hello from PebbleOS"); }
+void print_hex(unsigned long val) {
+  char buf[17];
+  char hex[] = "0123456789abcdef";
+  buf[16] = '\0';
+  for (int i = 15; i >= 0; i--) {
+    buf[i] = hex[val & 0xf];
+    val >>= 4;
+  }
+  print("0x");
+  print(buf);
+}
+
+void main() {
+  print("Hello from PebbleOS\n");
+}
