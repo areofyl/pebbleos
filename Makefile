@@ -29,8 +29,11 @@ timer.o: timer.c
 irq.o: irq.c
 	$(CC) $(CFLAGS) -c irq.c -o irq.o
 
-kernel.elf: boot.o vectors.o main.o exception.o gic.o timer.o irq.o linker.ld
-	$(LD) -T linker.ld boot.o vectors.o main.o exception.o gic.o timer.o irq.o -o kernel.elf
+pmm.o: pmm.c
+	$(CC) $(CFLAGS) -c pmm.c -o pmm.o
+
+kernel.elf: boot.o vectors.o main.o exception.o gic.o timer.o irq.o pmm.o linker.ld
+	$(LD) -T linker.ld boot.o vectors.o main.o exception.o gic.o timer.o irq.o pmm.o -o kernel.elf
 
 kernel.bin: kernel.elf
 	$(OBJCOPY) -O binary kernel.elf kernel.bin
