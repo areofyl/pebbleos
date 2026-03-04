@@ -20,8 +20,17 @@ main.o: main.c
 exception.o: exception.c
 	$(CC) $(CFLAGS) -c exception.c -o exception.o
 
-kernel.elf: boot.o vectors.o main.o exception.o linker.ld
-	$(LD) -T linker.ld boot.o vectors.o main.o exception.o -o kernel.elf
+gic.o: gic.c
+	$(CC) $(CFLAGS) -c gic.c -o gic.o
+
+timer.o: timer.c
+	$(CC) $(CFLAGS) -c timer.c -o timer.o
+
+irq.o: irq.c
+	$(CC) $(CFLAGS) -c irq.c -o irq.o
+
+kernel.elf: boot.o vectors.o main.o exception.o gic.o timer.o irq.o linker.ld
+	$(LD) -T linker.ld boot.o vectors.o main.o exception.o gic.o timer.o irq.o -o kernel.elf
 
 kernel.bin: kernel.elf
 	$(OBJCOPY) -O binary kernel.elf kernel.bin
