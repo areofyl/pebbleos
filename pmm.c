@@ -78,7 +78,7 @@ uint64_t alloc_page(void) {
 void free_page(uint64_t addr) {
     uint64_t page = (addr - RAM_START) / PAGE_SIZE;
 
-    if (page < first_free_page || page >= TOTAL_PAGES) {
+    if (page >= TOTAL_PAGES) {
         print("[pmm] bad free: ");
         print_hex(addr);
         print("\n");
@@ -86,4 +86,8 @@ void free_page(uint64_t addr) {
     }
 
     bitmap[page / 8] &= ~(1 << (page % 8));
+
+    // so alloc_page can find it again
+    if (page < first_free_page)
+        first_free_page = page;
 }
