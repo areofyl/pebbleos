@@ -61,6 +61,8 @@ typedef struct {
     uint32_t reply_max;    // max reply length
     // device mapping
     uint64_t device_va;  // VA of mapped device page (0 = none)
+    // name
+    char name[16];
 } proc_t;
 
 static proc_t procs[MAX_PROCS];
@@ -139,6 +141,7 @@ int proc_create(uint32_t num_pages, void (*entry)(void)) {
 
     p->saved_sp = (uint64_t)frame;
     p->ipc_target = -1;
+    p->name[0] = '\0';
     p->state = PROC_READY;
 
     print("[proc] created pid ");
@@ -404,6 +407,34 @@ uint64_t *ipc_call(uint64_t *frame, int target, uint64_t msg_ptr, uint32_t len,
     procs[sender].reply_buf = reply_buf;
     procs[sender].reply_max = reply_max;
     return ipc_send(frame, target, msg_ptr, len);
+}
+
+void proc_set_name(int pid, const char *name) {
+    if (pid < 0 || pid >= MAX_PROCS)
+        return;
+    int i;
+    for (i = 0; i < 15 && name[i]; i++)
+        procs[pid].name[i] = name[i];
+    procs[pid].name[i] = '\0';
+}
+
+// pack process info into user buffer
+// returns bytes written
+uint64_t proc_get_info(char *buf, uint64_t max) {
+    uint64_t pos = 0;
+    for (int i = 0; i < MAX_PROCS; i++) {
+        if (procs[i].state == PROC_UNUSED)
+            continue;
+        if (pos + 20 > max)
+            break;
+        buf[pos++] = (char)(uint8_t)i;                     // pid
+        buf[pos++] = (char)(uint8_t)procs[i].state;        // state
+        buf[pos++] = (char)(uint8_t)procs[i].num_pages;    // num_pages
+        buf[pos++] = 0;                                     // reserved
+        for (int j = 0; j < 16; j++)
+            buf[pos++] = procs[i].name[j];
+    }
+    return pos;
 }
 
 // reply to a caller blocked in BLOCKED_REPLY
