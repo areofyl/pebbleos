@@ -38,6 +38,7 @@ uint64_t *ipc_reply(uint64_t *frame, int target, uint64_t msg_ptr, uint32_t len)
 #define SYS_RECV   4
 #define SYS_CALL   5
 #define SYS_REPLY  6
+#define SYS_PROCINFO 7
 
 // sys_write(buf, len) - print len bytes from buf, or until \0 if len=0
 static void do_write(uint64_t *frame) {
@@ -66,6 +67,7 @@ static uint64_t *do_exit(uint64_t *frame);
 
 // forward decl for proc functions we need
 void proc_exit_current(void);
+uint64_t proc_get_info(char *buf, uint64_t max);
 
 static uint64_t *do_exit(uint64_t *frame) {
     proc_exit_current();
@@ -138,6 +140,13 @@ uint64_t syscall_handler(uint64_t frame_sp) {
             (int)frame[FRAME_X0],       // target pid
             frame[FRAME_X1],            // msg pointer
             (uint32_t)frame[FRAME_X2]); // length
+
+    case SYS_PROCINFO: {
+        uint64_t bytes = proc_get_info((char *)frame[FRAME_X0],
+                                       frame[FRAME_X1]);
+        frame[FRAME_X0] = bytes;
+        return (uint64_t)frame;
+    }
 
     default:
         print("[syscall] unknown: ");
