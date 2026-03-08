@@ -156,43 +156,51 @@ void mmu_init(void) {
     for (int i = 0; i < 512; i++)
         l1_table[i] = 0;
 
-    // 0x00000000 - 0x3FFFFFFF (1GB) device memory
-    // still a 1GB block, EL1-only
-    l1_table[0] = 0x00000000UL | PTE_VALID | PTE_BLOCK
-                 | PTE_AF | PTE_ATTR(MT_DEVICE);
+    // RPi 5 (BCM2712) memory layout:
+    //   RAM at 0x00000000, kernel loaded at 0x80000
+    //   peripherals at 0x107C000000+ (L1 index 65-66)
 
-    // 0x40000000 - 0x7FFFFFFF: use L2 table with 2MB blocks
-    // so we can give EL0 access to kernel text for SASOS
+    // 0x00000000 - 0x3FFFFFFF (1GB): RAM containing kernel
+    // use L2 table with 2MB blocks so we can fine-grain the first 2MB
     uint64_t *l2_ram = alloc_table();
-    l1_table[1] = (uint64_t)l2_ram | PTE_TABLE;
+    l1_table[0] = (uint64_t)l2_ram | PTE_TABLE;
 
-    // first 2MB (0x40000000-0x401fffff): use L3 table with 4KB pages
+    // first 2MB (0x00000000-0x001fffff): use L3 table with 4KB pages
     // text/rodata pages: AP_ROBOTH (EL0+EL1 read-only, both can execute)
     // data/BSS/stack pages: AP_RW (EL1-only read-write)
-    // ARM arch: AP[2:1]=01 forces PXN=1, so we CANNOT use AP_BOTH on executable pages
     uint64_t *l3_first = alloc_table();
     l2_ram[0] = (uint64_t)l3_first | PTE_TABLE;
 
     uint64_t rodata_end_pa = (uint64_t)_rodata_end;
     for (int i = 0; i < 512; i++) {
-        uint64_t pa = 0x40000000UL + (uint64_t)i * PAGE_SIZE;
+        uint64_t pa = (uint64_t)i * PAGE_SIZE;
         uint64_t flags = PTE_PAGE | PTE_AF | PTE_SH_INNER | PTE_ATTR(MT_NORMAL);
-        if (pa < rodata_end_pa)
-            flags |= PTE_AP_ROBOTH;  // EL0+EL1 read-only+exec
+        if (pa >= 0x80000 && pa < rodata_end_pa)
+            flags |= PTE_AP_ROBOTH;  // EL0+EL1 read-only+exec (kernel text)
         // else: default AP=00 → EL1 rw, EL0 none
         l3_first[i] = pa | flags;
     }
 
-    // remaining 126MB as 2MB blocks, EL1-only
+    // remaining 2MB blocks in first 1GB, EL1-only
     for (int i = 1; i < 64; i++) {
-        l2_ram[i] = (0x40000000UL + (uint64_t)i * 0x200000)
+        l2_ram[i] = ((uint64_t)i * 0x200000)
                   | PTE_VALID | PTE_BLOCK
                   | PTE_AF | PTE_SH_INNER | PTE_ATTR(MT_NORMAL);
     }
 
-    print("[mmu] 0x00000000-0x3fffffff -> device\n");
-    print("[mmu] 0x40000000-0x401fffff -> normal (L3 pages, text/rodata EL0+EL1 ro)\n");
-    print("[mmu] 0x40200000-0x47ffffff -> normal (EL1 only)\n");
+    // L1 entry 65 (0x107C000000-0x10BFFFFFFF): BCM2712 peripherals
+    // 1GB block mapped as device memory, EL1-only
+    l1_table[65] = 0x107C000000UL | PTE_VALID | PTE_BLOCK
+                 | PTE_AF | PTE_ATTR(MT_DEVICE);
+
+    // L1 entry 66 (0x10C0000000-0x10FFFFFFFF): more peripherals (GIC-400)
+    // GIC is at 0x107FFF9000 which falls in entry 65, but map 66 too for safety
+    l1_table[66] = 0x10C0000000UL | PTE_VALID | PTE_BLOCK
+                 | PTE_AF | PTE_ATTR(MT_DEVICE);
+
+    print("[mmu] 0x00000000-0x001fffff -> normal (L3, text/rodata EL0+EL1 ro)\n");
+    print("[mmu] 0x00200000-0x07ffffff -> normal (EL1 only)\n");
+    print("[mmu] 0x107C000000 -> device (BCM2712 peripherals)\n");
 
     // MAIR_EL1: what our attribute indices actually mean
     // attr0 = 0x00 -> device-nGnRnE (no gathering, no reordering, no early ack)
