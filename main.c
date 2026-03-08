@@ -99,6 +99,13 @@ static inline int sys_call(int pid, const char *msg, uint64_t len,
   return (int)x0; // reply length
 }
 
+static inline void sys_cacheflush(void *addr, uint64_t len) {
+  register uint64_t x0 asm("x0") = (uint64_t)addr;
+  register uint64_t x1 asm("x1") = len;
+  register uint64_t x8 asm("x8") = 8; // SYS_CACHEFLUSH
+  asm volatile("svc #0" : "+r"(x0) : "r"(x1), "r"(x8) : "memory");
+}
+
 static inline int sys_procinfo(char *buf, uint64_t max) {
   register uint64_t x0 asm("x0") = (uint64_t)buf;
   register uint64_t x1 asm("x1") = max;
@@ -242,7 +249,7 @@ static inline int ns_lookup_wait(const char *name) {
 
 #define FS_MAX_FILES 8
 #define FS_NAMELEN 16
-#define FS_DATALEN 256
+#define FS_DATALEN 1024
 #define FS_MAX_TAGS 4
 #define FS_KEYLEN 12
 #define FS_VALLEN 12
@@ -715,12 +722,712 @@ static void teled(volatile uint8_t *u, int fs_pid, const char *name) {
   }
 }
 
+// ---- tcc: tiny C compiler (JIT) ----
+// compiles a subset of C to aarch64 machine code and runs it
+//
+// supported:
+//   int variables (local only), if/else, while, return
+//   putc(expr), getc(), arithmetic, comparisons, char/int literals
+//   functions: only main() is compiled and executed
+//
+// codegen: single-pass recursive descent, emits into a buffer
+//   x19 = UART base (preserved), expression result always in x0
+//   locals on stack addressed via [x29, #-offset]
+
+// tokens
+#define T_NUM    1
+#define T_CHAR   2
+#define T_IDENT  3
+#define T_INT    10
+#define T_IF     11
+#define T_ELSE   12
+#define T_WHILE  13
+#define T_RETURN 14
+#define T_VOID   15
+#define T_EQ     20  // ==
+#define T_NE     21  // !=
+#define T_LE     22  // <=
+#define T_GE     23  // >=
+#define T_AND    24  // &&
+#define T_OR     25  // ||
+#define T_EOF    99
+
+typedef struct {
+  const char *src;
+  int pos;
+  int tok;
+  int num_val;
+  char ident[32];
+  // codegen
+  uint32_t *code;
+  int code_len;
+  int code_max;
+  // locals: name -> stack offset
+  char locals[16][16];
+  int local_offs[16]; // offset from x29 (negative)
+  int num_locals;
+  int stack_size; // current stack allocation for locals
+  // error
+  int error;
+  char errmsg[64];
+} cc_state_t;
+
+static void cc_emit(cc_state_t *cc, uint32_t insn) {
+  if (cc->code_len < cc->code_max)
+    cc->code[cc->code_len++] = insn;
+}
+
+static void cc_error(cc_state_t *cc, const char *msg) {
+  if (!cc->error) {
+    cc->error = 1;
+    int i = 0;
+    while (msg[i] && i < 63) {
+      cc->errmsg[i] = msg[i];
+      i++;
+    }
+    cc->errmsg[i] = '\0';
+  }
+}
+
+// lexer
+static void cc_skip_ws(cc_state_t *cc) {
+  while (cc->src[cc->pos] == ' ' || cc->src[cc->pos] == '\n' ||
+         cc->src[cc->pos] == '\r' || cc->src[cc->pos] == '\t')
+    cc->pos++;
+  // skip // comments
+  if (cc->src[cc->pos] == '/' && cc->src[cc->pos + 1] == '/') {
+    while (cc->src[cc->pos] && cc->src[cc->pos] != '\n')
+      cc->pos++;
+    cc_skip_ws(cc);
+  }
+}
+
+static int cc_is_alpha(char c) {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+}
+
+static int cc_is_digit(char c) { return c >= '0' && c <= '9'; }
+
+static int cc_kw(const char *a, const char *b) {
+  while (*a && *b && *a == *b) { a++; b++; }
+  return *a == *b;
+}
+
+static void cc_next(cc_state_t *cc) {
+  cc_skip_ws(cc);
+  char c = cc->src[cc->pos];
+
+  if (c == '\0') { cc->tok = T_EOF; return; }
+
+  // character literal
+  if (c == '\'') {
+    cc->pos++;
+    if (cc->src[cc->pos] == '\\') {
+      cc->pos++;
+      char e = cc->src[cc->pos++];
+      if (e == 'n') cc->num_val = '\n';
+      else if (e == 'r') cc->num_val = '\r';
+      else if (e == 't') cc->num_val = '\t';
+      else if (e == '0') cc->num_val = '\0';
+      else if (e == '\\') cc->num_val = '\\';
+      else if (e == '\'') cc->num_val = '\'';
+      else cc->num_val = e;
+    } else {
+      cc->num_val = cc->src[cc->pos++];
+    }
+    cc->pos++; // closing quote
+    cc->tok = T_NUM;
+    return;
+  }
+
+  // number
+  if (cc_is_digit(c)) {
+    cc->num_val = 0;
+    while (cc_is_digit(cc->src[cc->pos]))
+      cc->num_val = cc->num_val * 10 + (cc->src[cc->pos++] - '0');
+    cc->tok = T_NUM;
+    return;
+  }
+
+  // identifier or keyword
+  if (cc_is_alpha(c)) {
+    int i = 0;
+    while (cc_is_alpha(cc->src[cc->pos]) || cc_is_digit(cc->src[cc->pos])) {
+      if (i < 31) cc->ident[i++] = cc->src[cc->pos];
+      cc->pos++;
+    }
+    cc->ident[i] = '\0';
+    if (cc_kw(cc->ident, "int")) cc->tok = T_INT;
+    else if (cc_kw(cc->ident, "if")) cc->tok = T_IF;
+    else if (cc_kw(cc->ident, "else")) cc->tok = T_ELSE;
+    else if (cc_kw(cc->ident, "while")) cc->tok = T_WHILE;
+    else if (cc_kw(cc->ident, "return")) cc->tok = T_RETURN;
+    else if (cc_kw(cc->ident, "void")) cc->tok = T_VOID;
+    else cc->tok = T_IDENT;
+    return;
+  }
+
+  // two-char operators
+  if (c == '=' && cc->src[cc->pos + 1] == '=') { cc->pos += 2; cc->tok = T_EQ; return; }
+  if (c == '!' && cc->src[cc->pos + 1] == '=') { cc->pos += 2; cc->tok = T_NE; return; }
+  if (c == '<' && cc->src[cc->pos + 1] == '=') { cc->pos += 2; cc->tok = T_LE; return; }
+  if (c == '>' && cc->src[cc->pos + 1] == '=') { cc->pos += 2; cc->tok = T_GE; return; }
+  if (c == '&' && cc->src[cc->pos + 1] == '&') { cc->pos += 2; cc->tok = T_AND; return; }
+  if (c == '|' && cc->src[cc->pos + 1] == '|') { cc->pos += 2; cc->tok = T_OR; return; }
+
+  // single char token
+  cc->tok = c;
+  cc->pos++;
+}
+
+static void cc_expect(cc_state_t *cc, int tok) {
+  if (cc->tok != tok) {
+    cc_error(cc, "syntax error");
+    return;
+  }
+  cc_next(cc);
+}
+
+// find local variable, return stack offset (negative from x29)
+static int cc_find_local(cc_state_t *cc, const char *name) {
+  for (int i = 0; i < cc->num_locals; i++) {
+    if (cc_kw(cc->locals[i], name))
+      return cc->local_offs[i];
+  }
+  return 0; // not found
+}
+
+// add local variable, returns stack offset
+static int cc_add_local(cc_state_t *cc, const char *name) {
+  if (cc->num_locals >= 16) {
+    cc_error(cc, "too many locals");
+    return -8;
+  }
+  cc->stack_size += 8;
+  int off = cc->stack_size;
+  int idx = cc->num_locals++;
+  int i = 0;
+  while (name[i] && i < 15) { cc->locals[idx][i] = name[i]; i++; }
+  cc->locals[idx][i] = '\0';
+  cc->local_offs[idx] = off;
+  return off;
+}
+
+// aarch64 instruction encoders
+
+// movz xD, #imm16, lsl #shift
+static uint32_t a64_movz(int rd, uint32_t imm16, int shift) {
+  return 0xD2800000 | ((shift / 16) << 21) | ((imm16 & 0xFFFF) << 5) | rd;
+}
+// movk xD, #imm16, lsl #shift
+static uint32_t a64_movk(int rd, uint32_t imm16, int shift) {
+  return 0xF2800000 | ((shift / 16) << 21) | ((imm16 & 0xFFFF) << 5) | rd;
+}
+// load 64-bit immediate into register
+static void cc_load_imm(cc_state_t *cc, int rd, uint64_t val) {
+  cc_emit(cc, a64_movz(rd, val & 0xFFFF, 0));
+  if (val > 0xFFFF)
+    cc_emit(cc, a64_movk(rd, (val >> 16) & 0xFFFF, 16));
+  if (val > 0xFFFFFFFF)
+    cc_emit(cc, a64_movk(rd, (val >> 32) & 0xFFFF, 32));
+  if (val > 0xFFFFFFFFFFFF)
+    cc_emit(cc, a64_movk(rd, (val >> 48) & 0xFFFF, 48));
+}
+
+// stur x_src, [x_base, #simm9]  (store with signed offset)
+static uint32_t a64_stur(int src, int base, int simm9) {
+  return 0xF8000000 | ((simm9 & 0x1FF) << 12) | (base << 5) | src;
+}
+// ldur x_dst, [x_base, #simm9]
+static uint32_t a64_ldur(int dst, int base, int simm9) {
+  return 0xF8400000 | ((simm9 & 0x1FF) << 12) | (base << 5) | dst;
+}
+
+// sub xd, xn, #imm12
+static uint32_t a64_sub_imm(int rd, int rn, uint32_t imm12) {
+  return 0xD1000000 | ((imm12 & 0xFFF) << 10) | (rn << 5) | rd;
+}
+// add xd, xn, #imm12
+static uint32_t a64_add_imm(int rd, int rn, uint32_t imm12) {
+  return 0x91000000 | ((imm12 & 0xFFF) << 10) | (rn << 5) | rd;
+}
+
+// sub xd, xn, xm
+static uint32_t a64_sub_reg(int rd, int rn, int rm) {
+  return 0xCB000000 | (rm << 16) | (rn << 5) | rd;
+}
+// add xd, xn, xm
+static uint32_t a64_add_reg(int rd, int rn, int rm) {
+  return 0x8B000000 | (rm << 16) | (rn << 5) | rd;
+}
+// mul xd, xn, xm
+static uint32_t a64_mul(int rd, int rn, int rm) {
+  return 0x9B007C00 | (rm << 16) | (rn << 5) | rd;
+}
+// sdiv xd, xn, xm
+static uint32_t a64_sdiv(int rd, int rn, int rm) {
+  return 0x9AC00C00 | (rm << 16) | (rn << 5) | rd;
+}
+
+// cmp xn, xm
+static uint32_t a64_cmp(int rn, int rm) {
+  return 0xEB000000 | (rm << 16) | (rn << 5) | 0x1F; // rd=xzr
+}
+
+// cset xd, cond
+static uint32_t a64_cset(int rd, int cond) {
+  // cset is csinc rd, xzr, xzr, invert(cond)
+  int inv = cond ^ 1;
+  return 0x9A9F07E0 | (inv << 12) | rd;
+}
+
+// b.cond offset (offset in instructions, signed)
+static uint32_t a64_bcond(int cond, int off_insns) {
+  return 0x54000000 | ((off_insns & 0x7FFFF) << 5) | cond;
+}
+
+// b offset
+static uint32_t a64_b(int off_insns) {
+  return 0x14000000 | (off_insns & 0x3FFFFFF);
+}
+
+// cbz x_reg, offset
+static uint32_t a64_cbz(int reg, int off_insns) {
+  return 0xB4000000 | ((off_insns & 0x7FFFF) << 5) | reg;
+}
+
+// ret
+static uint32_t a64_ret(void) {
+  return 0xD65F03C0;
+}
+
+// stp x_a, x_b, [sp, #imm7*8]!  (pre-index)
+static uint32_t a64_stp_pre(int a, int b, int imm7) {
+  return 0xA9800000 | ((imm7 & 0x7F) << 15) | (b << 10) | (31 << 5) | a;
+}
+// ldp x_a, x_b, [sp], #imm7*8  (post-index)
+static uint32_t a64_ldp_post(int a, int b, int imm7) {
+  return 0xA8C00000 | ((imm7 & 0x7F) << 15) | (b << 10) | (31 << 5) | a;
+}
+
+// mov xd, xn (alias for orr xd, xzr, xn)
+static uint32_t a64_mov(int rd, int rn) {
+  return 0xAA0003E0 | (rn << 16) | rd;
+}
+
+// strb w_src, [x_base]
+static uint32_t a64_strb(int src, int base) {
+  return 0x39000000 | (base << 5) | src;
+}
+// ldrb w_dst, [x_base]
+static uint32_t a64_ldrb(int dst, int base) {
+  return 0x39400000 | (base << 5) | dst;
+}
+// ldrb w_dst, [x_base, #imm12]
+static uint32_t a64_ldrb_off(int dst, int base, int off) {
+  return 0x39400000 | ((off & 0xFFF) << 10) | (base << 5) | dst;
+}
+
+// tst bits: ands xzr, xn, xm
+// we won't need this, using cmp instead
+
+// forward declarations for recursive descent
+static void cc_expr(cc_state_t *cc);
+static void cc_block(cc_state_t *cc);
+
+// ---- expression parser / codegen ----
+// result always in x0
+
+static void cc_primary(cc_state_t *cc) {
+  if (cc->error) return;
+
+  if (cc->tok == T_NUM) {
+    cc_load_imm(cc, 0, (uint64_t)(uint32_t)cc->num_val);
+    cc_next(cc);
+  } else if (cc->tok == T_IDENT) {
+    char name[32];
+    int i = 0;
+    while (cc->ident[i] && i < 31) { name[i] = cc->ident[i]; i++; }
+    name[i] = '\0';
+    cc_next(cc);
+
+    if (cc->tok == '(') {
+      // function call
+      cc_next(cc);
+      if (cc_kw(name, "putc")) {
+        // putc(expr) -> write char to UART
+        cc_expr(cc);
+        // store byte at [x19] (UART data register)
+        cc_emit(cc, a64_strb(0, 19));
+      } else if (cc_kw(name, "getc")) {
+        // getc() -> poll UART, return char in x0
+        // poll: ldrb w1, [x19, #0x18]; tst w1, #(1<<4); b.ne poll; ldrb w0, [x19]
+        int poll_pc = cc->code_len;
+        cc_emit(cc, a64_ldrb_off(1, 19, 0x18)); // ldrb w1, [x19, #0x18]
+        // tst w1, #16 -> ands wzr, w1, #16
+        // encoding for ands wzr, w1, #16 (imm bitmask for bit 4)
+        // simpler: and w2, w1, #16; cbnz w2, poll
+        cc_emit(cc, 0x12100021); // and w1, w1, #0x10
+        int branch_pc = cc->code_len;
+        cc_emit(cc, 0); // placeholder for cbnz
+        cc_emit(cc, a64_ldrb(0, 19)); // ldrb w0, [x19]
+        int after_pc = cc->code_len;
+        // patch: cbnz w1, poll_pc (go back if RXFE set)
+        int back = poll_pc - branch_pc;
+        cc->code[branch_pc] = 0x35000000 | ((back & 0x7FFFF) << 5) | 1; // cbnz w1
+        (void)after_pc;
+      } else {
+        cc_error(cc, "unknown function");
+      }
+      cc_expect(cc, ')');
+    } else {
+      // variable load
+      int off = cc_find_local(cc, name);
+      if (!off) {
+        cc_error(cc, "undefined variable");
+        return;
+      }
+      cc_emit(cc, a64_ldur(0, 29, -off));
+    }
+  } else if (cc->tok == '(') {
+    cc_next(cc);
+    cc_expr(cc);
+    cc_expect(cc, ')');
+  } else if (cc->tok == '-') {
+    // unary minus
+    cc_next(cc);
+    cc_primary(cc);
+    // neg x0, x0 -> sub x0, xzr, x0
+    cc_emit(cc, a64_sub_reg(0, 31, 0));
+  } else if (cc->tok == '!') {
+    cc_next(cc);
+    cc_primary(cc);
+    // cmp x0, #0; cset x0, eq
+    cc_emit(cc, 0xF100001F); // cmp x0, #0
+    cc_emit(cc, a64_cset(0, 0)); // cset x0, eq (cond 0 = EQ)
+  } else {
+    cc_error(cc, "unexpected token");
+  }
+}
+
+static void cc_mul_expr(cc_state_t *cc) {
+  cc_primary(cc);
+  while (cc->tok == '*' || cc->tok == '/' || cc->tok == '%') {
+    int op = cc->tok;
+    cc_next(cc);
+    // push x0
+    cc_emit(cc, a64_stp_pre(0, 30, -2)); // stp x0, x30, [sp, #-16]!
+    cc_primary(cc);
+    // pop left into x1
+    cc_emit(cc, a64_ldp_post(1, 30, 2)); // ldp x1, x30, [sp], #16
+    // x1 = left, x0 = right
+    if (op == '*')
+      cc_emit(cc, a64_mul(0, 1, 0));
+    else if (op == '/')
+      cc_emit(cc, a64_sdiv(0, 1, 0));
+    else {
+      // modulo: x0 = x1 - (x1/x0)*x0
+      cc_emit(cc, a64_sdiv(2, 1, 0));  // x2 = x1 / x0
+      cc_emit(cc, 0x9B008040 | (0 << 16) | (2 << 5) | 0); // msub x0, x2, x0, x1
+      // msub xd, xn, xm, xa = xa - xn*xm
+      // encoding: 0x9B00_8000 | rm<<16 | ra<<10 | rn<<5 | rd
+      cc->code[cc->code_len - 1] = 0x9B008000 | (0 << 16) | (1 << 10) | (2 << 5) | 0;
+    }
+  }
+}
+
+static void cc_add_expr(cc_state_t *cc) {
+  cc_mul_expr(cc);
+  while (cc->tok == '+' || cc->tok == '-') {
+    int op = cc->tok;
+    cc_next(cc);
+    cc_emit(cc, a64_stp_pre(0, 30, -2));
+    cc_mul_expr(cc);
+    cc_emit(cc, a64_ldp_post(1, 30, 2));
+    if (op == '+')
+      cc_emit(cc, a64_add_reg(0, 1, 0));
+    else
+      cc_emit(cc, a64_sub_reg(0, 1, 0));
+  }
+}
+
+static void cc_cmp_expr(cc_state_t *cc) {
+  cc_add_expr(cc);
+  while (cc->tok == '<' || cc->tok == '>' || cc->tok == T_LE || cc->tok == T_GE) {
+    int op = cc->tok;
+    cc_next(cc);
+    cc_emit(cc, a64_stp_pre(0, 30, -2));
+    cc_add_expr(cc);
+    cc_emit(cc, a64_ldp_post(1, 30, 2));
+    cc_emit(cc, a64_cmp(1, 0)); // cmp left, right
+    if (op == '<') cc_emit(cc, a64_cset(0, 11));       // lt
+    else if (op == '>') cc_emit(cc, a64_cset(0, 12));   // gt
+    else if (op == T_LE) cc_emit(cc, a64_cset(0, 13));  // le
+    else cc_emit(cc, a64_cset(0, 10));                   // ge
+  }
+}
+
+static void cc_eq_expr(cc_state_t *cc) {
+  cc_cmp_expr(cc);
+  while (cc->tok == T_EQ || cc->tok == T_NE) {
+    int op = cc->tok;
+    cc_next(cc);
+    cc_emit(cc, a64_stp_pre(0, 30, -2));
+    cc_cmp_expr(cc);
+    cc_emit(cc, a64_ldp_post(1, 30, 2));
+    cc_emit(cc, a64_cmp(1, 0));
+    if (op == T_EQ) cc_emit(cc, a64_cset(0, 0));  // eq
+    else cc_emit(cc, a64_cset(0, 1));               // ne
+  }
+}
+
+static void cc_and_expr(cc_state_t *cc) {
+  cc_eq_expr(cc);
+  while (cc->tok == T_AND) {
+    cc_next(cc);
+    // short circuit: if x0 == 0, skip right side
+    cc_emit(cc, 0xF100001F); // cmp x0, #0
+    int patch = cc->code_len;
+    cc_emit(cc, 0); // placeholder for b.eq (skip)
+    cc_eq_expr(cc);
+    // patch: b.eq to here
+    int off = cc->code_len - patch;
+    cc->code[patch] = a64_bcond(0, off); // b.eq
+  }
+}
+
+static void cc_or_expr(cc_state_t *cc) {
+  cc_and_expr(cc);
+  while (cc->tok == T_OR) {
+    cc_next(cc);
+    // short circuit: if x0 != 0, skip right side
+    cc_emit(cc, 0xF100001F); // cmp x0, #0
+    int patch = cc->code_len;
+    cc_emit(cc, 0); // placeholder for b.ne (skip)
+    cc_and_expr(cc);
+    int off = cc->code_len - patch;
+    cc->code[patch] = a64_bcond(1, off); // b.ne
+  }
+}
+
+static void cc_expr(cc_state_t *cc) {
+  if (cc->error) return;
+
+  // check for assignment: ident = expr
+  if (cc->tok == T_IDENT) {
+    // peek ahead for '='
+    char name[32];
+    int i = 0;
+    while (cc->ident[i] && i < 31) { name[i] = cc->ident[i]; i++; }
+    name[i] = '\0';
+    int save_pos = cc->pos;
+    int save_tok = cc->tok;
+    cc_next(cc);
+    if (cc->tok == '=' ) {
+      // check it's not ==
+      // (we already consumed the token, if it's '=' it's assignment since == is a separate token)
+      cc_next(cc);
+      cc_expr(cc);
+      int off = cc_find_local(cc, name);
+      if (!off) {
+        cc_error(cc, "undefined variable");
+        return;
+      }
+      cc_emit(cc, a64_stur(0, 29, -off));
+      return;
+    }
+    // not assignment, backtrack
+    cc->pos = save_pos;
+    cc->tok = save_tok;
+    // restore ident
+    for (int j = 0; j < 32; j++) cc->ident[j] = name[j];
+  }
+
+  cc_or_expr(cc);
+}
+
+// ---- statement parser ----
+
+static void cc_stmt(cc_state_t *cc) {
+  if (cc->error) return;
+
+  if (cc->tok == T_INT) {
+    // int x; or int x = expr;
+    cc_next(cc);
+    if (cc->tok != T_IDENT) { cc_error(cc, "expected name"); return; }
+    char name[32];
+    int i = 0;
+    while (cc->ident[i] && i < 31) { name[i] = cc->ident[i]; i++; }
+    name[i] = '\0';
+    cc_next(cc);
+
+    int off = cc_add_local(cc, name);
+
+    if (cc->tok == '=') {
+      cc_next(cc);
+      cc_expr(cc);
+      cc_emit(cc, a64_stur(0, 29, -off));
+    } else {
+      // zero-init
+      cc_emit(cc, a64_stur(31, 29, -off)); // store xzr
+    }
+    cc_expect(cc, ';');
+
+  } else if (cc->tok == T_IF) {
+    cc_next(cc);
+    cc_expect(cc, '(');
+    cc_expr(cc);
+    cc_expect(cc, ')');
+    // cbz x0, else_or_end
+    int patch_else = cc->code_len;
+    cc_emit(cc, 0); // placeholder
+    cc_block(cc);
+    if (cc->tok == T_ELSE) {
+      cc_next(cc);
+      int patch_end = cc->code_len;
+      cc_emit(cc, 0); // placeholder for b end
+      // patch else branch to here
+      cc->code[patch_else] = a64_cbz(0, cc->code_len - patch_else);
+      cc_block(cc);
+      // patch end branch
+      cc->code[patch_end] = a64_b(cc->code_len - patch_end);
+    } else {
+      cc->code[patch_else] = a64_cbz(0, cc->code_len - patch_else);
+    }
+
+  } else if (cc->tok == T_WHILE) {
+    cc_next(cc);
+    int loop_top = cc->code_len;
+    cc_expect(cc, '(');
+    cc_expr(cc);
+    cc_expect(cc, ')');
+    int patch_exit = cc->code_len;
+    cc_emit(cc, 0); // placeholder cbz
+    cc_block(cc);
+    // b loop_top
+    cc_emit(cc, a64_b(loop_top - cc->code_len));
+    // patch exit
+    cc->code[patch_exit] = a64_cbz(0, cc->code_len - patch_exit);
+
+  } else if (cc->tok == T_RETURN) {
+    cc_next(cc);
+    if (cc->tok != ';') {
+      cc_expr(cc);
+    }
+    // epilogue: restore and ret
+    cc_emit(cc, a64_add_imm(31, 29, 0)); // mov sp, x29
+    cc_emit(cc, a64_ldp_post(19, 20, 2)); // ldp x19, x20, [sp], #16
+    cc_emit(cc, a64_ldp_post(29, 30, 2)); // ldp x29, x30, [sp], #16
+    cc_emit(cc, a64_ret());
+    cc_expect(cc, ';');
+
+  } else {
+    // expression statement
+    cc_expr(cc);
+    cc_expect(cc, ';');
+  }
+}
+
+static void cc_block(cc_state_t *cc) {
+  if (cc->error) return;
+  cc_expect(cc, '{');
+  while (cc->tok != '}' && cc->tok != T_EOF && !cc->error) {
+    cc_stmt(cc);
+  }
+  cc_expect(cc, '}');
+}
+
+// compile and run source code, uart_base passed for I/O
+static void cc_run(volatile uint8_t *u, int fs_pid, const char *filename) {
+  char src[1024];
+  int slen = fs_read(fs_pid, filename, src, 1023);
+  if (slen <= 0) {
+    shell_puts(u, "error: can't read file\n");
+    return;
+  }
+  src[slen] = '\0';
+
+  // JIT buffer on stack
+  uint32_t code_buf[512]; // 2KB
+
+  cc_state_t cc;
+  cc.src = src;
+  cc.pos = 0;
+  cc.tok = 0;
+  cc.code = code_buf;
+  cc.code_len = 0;
+  cc.code_max = 512;
+  cc.num_locals = 0;
+  cc.stack_size = 0;
+  cc.error = 0;
+  cc.errmsg[0] = '\0';
+
+  // lex first token
+  cc_next(&cc);
+
+  // expect: int/void main() { ... }
+  if (cc.tok == T_INT || cc.tok == T_VOID) cc_next(&cc);
+  if (cc.tok != T_IDENT || !cc_kw(cc.ident, "main")) {
+    shell_puts(u, "error: expected main()\n");
+    return;
+  }
+  cc_next(&cc);
+  cc_expect(&cc, '(');
+  cc_expect(&cc, ')');
+
+  // emit prologue
+  cc_emit(&cc, a64_stp_pre(29, 30, -2));   // stp x29, x30, [sp, #-16]!
+  cc_emit(&cc, a64_stp_pre(19, 20, -2));   // stp x19, x20, [sp, #-16]! (save callee-saved)
+  cc_emit(&cc, a64_add_imm(29, 31, 0));      // mov x29, sp
+  // reserve stack space for locals — we'll patch this
+  int stack_patch = cc.code_len;
+  cc_emit(&cc, 0); // placeholder: sub sp, sp, #N
+  // save uart base (x19)
+  // caller will put it in x0, move to x19
+  cc_emit(&cc, a64_mov(19, 0));
+
+  // parse body
+  cc_block(&cc);
+
+  if (cc.error) {
+    shell_puts(u, "compile error: ");
+    shell_puts(u, cc.errmsg);
+    shell_puts(u, "\n");
+    return;
+  }
+
+  // emit epilogue (for implicit return)
+  cc_load_imm(&cc, 0, 0);
+  cc_emit(&cc, a64_add_imm(31, 29, 0)); // mov sp, x29
+  cc_emit(&cc, a64_ldp_post(19, 20, 2)); // restore x19, x20
+  cc_emit(&cc, a64_ldp_post(29, 30, 2)); // restore x29, x30
+  cc_emit(&cc, a64_ret());
+
+  // patch stack reservation (align to 16)
+  int frame_size = (cc.stack_size + 15) & ~15;
+  if (frame_size == 0) frame_size = 16;
+  cc.code[stack_patch] = a64_sub_imm(31, 31, frame_size);
+
+  // flush icache
+  sys_cacheflush(code_buf, cc.code_len * 4);
+
+  // run it! pass UART base as argument
+  shell_puts(u, "[cc] running...\n");
+  typedef int (*jit_fn)(uint64_t);
+  jit_fn fn = (jit_fn)(void *)code_buf;
+  int result = fn((uint64_t)u);
+
+  shell_puts(u, "\n[cc] exit code: ");
+  shell_put_int(u, result);
+  shell_puts(u, "\n");
+}
+
 void shell_task(uint64_t uart_base) {
   volatile uint8_t *u = (volatile uint8_t *)uart_base;
 
   int fs_pid = ns_lookup_wait("fs");
 
-  // ---- boot splash (once) ----
+  // ---- boot splash ----
   shell_puts(u, "\033[2J\033[H"); // clear screen
   shell_puts(u, "\n");
   shell_puts(u, "  _       _  ___  ____\n");
@@ -729,119 +1436,29 @@ void shell_task(uint64_t uart_base) {
   shell_puts(u, " | ||  __/ | |_| |___) |\n");
   shell_puts(u, "  \\__\\___|_|\\___/|____/\n");
   shell_puts(u, "\n");
+  shell_puts(u, "Type 'help' for commands.\n");
+  shell_puts(u, "Try 'cat hello.c' then 'cc hello.c'\n\n");
 
-  for (volatile int d = 0; d < 2000000; d++)
-    ;
-  shell_puts(u, "[boot] initializing kernel...\n");
-  for (volatile int d = 0; d < 2000000; d++)
-    ;
-  shell_puts(u, "[boot] memory: 128MB\n");
-  for (volatile int d = 0; d < 1500000; d++)
-    ;
-  shell_puts(u, "[boot] mmu: enabled\n");
-  for (volatile int d = 0; d < 2000000; d++)
-    ;
-  shell_puts(u, "[boot] starting services...\n");
-  for (volatile int d = 0; d < 1500000; d++)
-    ;
-  shell_puts(u, "[boot] uart server    [ok]\n");
-  for (volatile int d = 0; d < 1000000; d++)
-    ;
-  shell_puts(u, "[boot] nameserver     [ok]\n");
-  for (volatile int d = 0; d < 1000000; d++)
-    ;
-  shell_puts(u, "[boot] filesystem     [ok]\n");
-  for (volatile int d = 0; d < 2000000; d++)
-    ;
-  shell_puts(u, "[boot] ready.\n");
-  for (volatile int d = 0; d < 3000000; d++)
-    ;
-
-  shell_puts(u, "\nhostname: telos\n\n");
+  // pre-create a sample hello.c
+  fs_create(fs_pid, "hello.c");
+  {
+    const char *sample =
+      "int main() {\n"
+      "  int i = 0;\n"
+      "  while (i < 10) {\n"
+      "    putc('0' + i);\n"
+      "    putc('\\n');\n"
+      "    i = i + 1;\n"
+      "  }\n"
+      "  return 0;\n"
+      "}\n";
+    fs_write(fs_pid, "hello.c", sample, u_strlen(sample));
+  }
 
   char cmd_buf[128];
-  char username[32];
 
-  // ---- outer loop: login + shell ----
+  // ---- command loop ----
   for (;;) {
-    // ---- login prompt ----
-    shell_puts(u, "login: ");
-    int upos = 0;
-    for (;;) {
-      char c = shell_getc(u);
-      if (c == '\r' || c == '\n') {
-        shell_puts(u, "\n");
-        break;
-      }
-      if (c == 0x7f || c == 0x08) {
-        if (upos > 0) {
-          upos--;
-          shell_puts(u, "\b \b");
-        }
-        continue;
-      }
-      if (upos < 31) {
-        username[upos++] = c;
-        shell_putc(u, c);
-      }
-    }
-    username[upos] = '\0';
-    if (upos == 0)
-      continue; // empty username, retry
-
-    // password (echo asterisks)
-    shell_puts(u, "password: ");
-    int ppos = 0;
-    for (;;) {
-      char c = shell_getc(u);
-      if (c == '\r' || c == '\n') {
-        shell_puts(u, "\n");
-        break;
-      }
-      if (c == 0x7f || c == 0x08) {
-        if (ppos > 0) {
-          ppos--;
-          shell_puts(u, "\b \b");
-        }
-        continue;
-      }
-      if (ppos < 127) {
-        ppos++;
-        shell_putc(u, '*');
-      }
-    }
-
-    // authenticating delay
-    shell_puts(u, "authenticating...");
-    for (volatile int d = 0; d < 5000000; d++)
-      ;
-    shell_puts(u, " Login successful.\n");
-    shell_puts(u, "Welcome back, ");
-    shell_puts(u, username);
-    shell_puts(u, "!\n\n");
-
-    for (volatile int d = 0; d < 3000000; d++)
-      ;
-    shell_puts(u, "\033[2J\033[H"); // clear screen
-
-    // ---- tutorial ----
-    shell_puts(u, "telOS uses a tag-based filesystem:\n");
-    shell_puts(u, "  - Files have key:value tags instead of directories\n");
-    shell_puts(u, "  - Use 'tag <file> <key> <val>' to label files\n");
-    shell_puts(u, "  - Use 'query <key> <val>' to find matching files\n");
-    shell_puts(u, "\n");
-    shell_puts(u, "Example workflow:\n");
-    shell_puts(u, "  telos> create hello.txt\n");
-    shell_puts(u, "  telos> write hello.txt Hello World!\n");
-    shell_puts(u, "  telos> tag hello.txt type text\n");
-    shell_puts(u, "  telos> tag hello.txt topic greeting\n");
-    shell_puts(u, "  telos> query type text\n");
-    shell_puts(u, "  telos> tags hello.txt\n");
-    shell_puts(u, "  telos> cat hello.txt\n");
-    shell_puts(u, "\n");
-    shell_puts(u, "Type 'help' for available commands.\n\n");
-
-    // ---- command loop ----
     for (;;) {
       shell_puts(u, "telos> ");
 
@@ -888,27 +1505,28 @@ void shell_task(uint64_t uart_base) {
       if (argc == 0)
         continue;
 
-      if (u_streq(argv[0], "logout")) {
-        shell_puts(u, "Logged out.\n");
-        break; // back to login
-
-      } else if (u_streq(argv[0], "clear")) {
+      if (u_streq(argv[0], "clear")) {
         shell_puts(u, "\033[2J\033[H");
 
       } else if (u_streq(argv[0], "telfetch")) {
         shell_puts(u, "\n");
-        shell_puts(u, "  _       _  ___  ____     ");
-        shell_puts(u, username);
-        shell_puts(u, "@telos\n");
+        shell_puts(u, "  _       _  ___  ____     telos\n");
         shell_puts(u, " | |_ ___| |/ _ \\/ ___|    --------\n");
         shell_puts(u, " | __/ _ \\ | | | \\___ \\    OS: telOS v0.1\n");
         shell_puts(u, " | ||  __/ | |_| |___) |   Kernel: telos-arm64\n");
         shell_puts(u, "  \\__\\___|_|\\___/|____/    Shell: tsh\n");
         shell_puts(u, "                           Editor: teled\n");
-        shell_puts(u,
-                   "                           CPU: ARM Cortex-A (aarch64)\n");
+        shell_puts(u, "                           CC: tcc (JIT)\n");
+        shell_puts(u, "                           CPU: ARM Cortex-A (aarch64)\n");
         shell_puts(u, "                           Memory: 128MB\n");
         shell_puts(u, "\n");
+
+      } else if (u_streq(argv[0], "cc")) {
+        if (argc < 2) {
+          shell_puts(u, "usage: cc <file>\n");
+        } else {
+          cc_run(u, fs_pid, argv[1]);
+        }
 
       } else if (u_streq(argv[0], "teled")) {
         if (argc < 2) {
@@ -927,11 +1545,11 @@ void shell_task(uint64_t uart_base) {
         shell_puts(u, "  query <k> <v>   - find files by tag\n");
         shell_puts(u, "  tags <file>     - show file's tags\n");
         shell_puts(u, "  teled <file>    - text editor\n");
+        shell_puts(u, "  cc <file>       - compile & run C\n");
         shell_puts(u, "  ps              - list running tasks\n");
         shell_puts(u, "  top             - live task monitor\n");
         shell_puts(u, "  telfetch        - system info\n");
         shell_puts(u, "  clear           - clear screen\n");
-        shell_puts(u, "  logout          - log out\n");
         shell_puts(u, "  help            - this message\n");
 
       } else if (u_streq(argv[0], "ls")) {
@@ -1114,7 +1732,7 @@ void shell_task(uint64_t uart_base) {
         shell_puts(u, "\ntype 'help' for commands\n");
       }
     } // command loop
-  } // login loop
+  }
 }
 
 // ---- entry point ----
