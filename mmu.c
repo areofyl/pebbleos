@@ -188,19 +188,41 @@ void mmu_init(void) {
                   | PTE_AF | PTE_SH_INNER | PTE_ATTR(MT_NORMAL);
     }
 
-    // L1 entry 65 (0x107C000000-0x10BFFFFFFF): BCM2712 peripherals
-    // 1GB block mapped as device memory, EL1-only
-    l1_table[65] = 0x107C000000UL | PTE_VALID | PTE_BLOCK
-                 | PTE_AF | PTE_ATTR(MT_DEVICE);
+    // L1 entries for device memory regions
+    // With 4KB granule + 39-bit VA, L1 can't use block descriptors (1GB blocks
+    // only work with 36-bit or larger granule). Must use L2 table with 2MB blocks.
 
-    // L1 entry 66 (0x10C0000000-0x10FFFFFFFF): more peripherals (GIC-400)
-    // GIC is at 0x107FFF9000 which falls in entry 65, but map 66 too for safety
-    l1_table[66] = 0x10C0000000UL | PTE_VALID | PTE_BLOCK
-                 | PTE_AF | PTE_ATTR(MT_DEVICE);
+    // L1 entry 65: BCM2712 peripherals (0x107C000000)
+    uint64_t *l2_periph = alloc_table();
+    l1_table[65] = (uint64_t)l2_periph | PTE_TABLE;
+    for (int i = 0; i < 512; i++) {
+        l2_periph[i] = (0x107C000000UL + (uint64_t)i * 0x200000)
+                     | PTE_VALID | PTE_BLOCK
+                     | PTE_AF | PTE_ATTR(MT_DEVICE);
+    }
+
+    // L1 entry 66: more peripherals
+    uint64_t *l2_periph2 = alloc_table();
+    l1_table[66] = (uint64_t)l2_periph2 | PTE_TABLE;
+    for (int i = 0; i < 512; i++) {
+        l2_periph2[i] = (0x10C0000000UL + (uint64_t)i * 0x200000)
+                      | PTE_VALID | PTE_BLOCK
+                      | PTE_AF | PTE_ATTR(MT_DEVICE);
+    }
+
+    // L1 entry 124: RP1 peripherals (0x1F00000000, UART0 at 0x1F00030000)
+    uint64_t *l2_rp1 = alloc_table();
+    l1_table[124] = (uint64_t)l2_rp1 | PTE_TABLE;
+    for (int i = 0; i < 512; i++) {
+        l2_rp1[i] = (0x1F00000000UL + (uint64_t)i * 0x200000)
+                   | PTE_VALID | PTE_BLOCK
+                   | PTE_AF | PTE_ATTR(MT_DEVICE);
+    }
 
     print("[mmu] 0x00000000-0x001fffff -> normal (L3, text/rodata EL0+EL1 ro)\n");
     print("[mmu] 0x00200000-0x07ffffff -> normal (EL1 only)\n");
     print("[mmu] 0x107C000000 -> device (BCM2712 peripherals)\n");
+    print("[mmu] 0x1F00000000 -> device (RP1 peripherals)\n");
 
     // MAIR_EL1: what our attribute indices actually mean
     // attr0 = 0x00 -> device-nGnRnE (no gathering, no reordering, no early ack)
@@ -210,16 +232,18 @@ void mmu_init(void) {
     asm volatile("msr mair_el1, %0" : : "r"(mair));
 
     // TCR_EL1: translation control register
-    // T0SZ  = 25 -> 39-bit VA (512GB, way more than we need)
+    // T0SZ  = 25 -> 39-bit VA (512GB)
     // TG0   = 0b00 -> 4KB granule
     // SH0   = 0b11 -> inner shareable
     // ORGN0 = 0b01 -> outer write-back cacheable
     // IRGN0 = 0b01 -> inner write-back cacheable
+    // IPS   = 0b010 -> 40-bit PA (1TB, needed for peripherals above 4GB)
     uint64_t tcr = (25UL << 0)      // T0SZ
                  | (0b00UL << 14)   // TG0
                  | (0b11UL << 12)   // SH0
                  | (0b01UL << 10)   // ORGN0
-                 | (0b01UL << 8);   // IRGN0
+                 | (0b01UL << 8)    // IRGN0
+                 | (0b010UL << 32); // IPS = 40-bit
     asm volatile("msr tcr_el1, %0" : : "r"(tcr));
 
     // point TTBR0 at our L1 table
@@ -227,6 +251,16 @@ void mmu_init(void) {
 
     // invalidate TLB and make sure everything above is visible
     asm volatile("tlbi vmalle1");
+    asm volatile("dsb sy");
+    asm volatile("isb");
+
+    // clean and invalidate caches before enabling MMU
+    asm volatile("ic iallu");   // invalidate instruction cache
+    asm volatile("dsb sy");
+    asm volatile("isb");
+
+    // clean and invalidate caches before enabling MMU
+    asm volatile("ic iallu");
     asm volatile("dsb sy");
     asm volatile("isb");
 
