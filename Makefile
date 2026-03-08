@@ -41,8 +41,11 @@ proc.o: proc.c
 syscall.o: syscall.c
 	$(CC) $(CFLAGS) -c syscall.c -o syscall.o
 
-kernel.elf: boot.o vectors.o main.o exception.o gic.o timer.o irq.o pmm.o mmu.o proc.o syscall.o linker.ld
-	$(LD) -T linker.ld boot.o vectors.o main.o exception.o gic.o timer.o irq.o pmm.o mmu.o proc.o syscall.o -o kernel.elf
+ramfb.o: ramfb.c
+	$(CC) $(CFLAGS) -c ramfb.c -o ramfb.o
+
+kernel.elf: boot.o vectors.o main.o exception.o gic.o timer.o irq.o pmm.o mmu.o proc.o syscall.o ramfb.o linker.ld
+	$(LD) -T linker.ld boot.o vectors.o main.o exception.o gic.o timer.o irq.o pmm.o mmu.o proc.o syscall.o ramfb.o -o kernel.elf
 
 kernel.bin: kernel.elf
 	$(OBJCOPY) -O binary kernel.elf kernel.bin
