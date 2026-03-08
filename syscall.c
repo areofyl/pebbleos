@@ -39,6 +39,7 @@ uint64_t *ipc_reply(uint64_t *frame, int target, uint64_t msg_ptr, uint32_t len)
 #define SYS_CALL   5
 #define SYS_REPLY  6
 #define SYS_PROCINFO 7
+#define SYS_CACHEFLUSH 8
 
 // sys_write(buf, len) - print len bytes from buf, or until \0 if len=0
 static void do_write(uint64_t *frame) {
@@ -140,6 +141,26 @@ uint64_t syscall_handler(uint64_t frame_sp) {
             (int)frame[FRAME_X0],       // target pid
             frame[FRAME_X1],            // msg pointer
             (uint32_t)frame[FRAME_X2]); // length
+
+    case SYS_CACHEFLUSH: {
+        // flush dcache + invalidate icache for a VA range
+        // x0 = start address, x1 = length
+        uint64_t addr = frame[FRAME_X0];
+        uint64_t len = frame[FRAME_X1];
+        for (uint64_t i = 0; i < len; i += 4) {
+            uint64_t va = addr + i;
+            asm volatile("dc cvau, %0" : : "r"(va));
+        }
+        asm volatile("dsb ish");
+        for (uint64_t i = 0; i < len; i += 4) {
+            uint64_t va = addr + i;
+            asm volatile("ic ivau, %0" : : "r"(va));
+        }
+        asm volatile("dsb ish");
+        asm volatile("isb");
+        frame[FRAME_X0] = 0;
+        return (uint64_t)frame;
+    }
 
     case SYS_PROCINFO: {
         uint64_t bytes = proc_get_info((char *)frame[FRAME_X0],
