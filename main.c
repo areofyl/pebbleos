@@ -29,6 +29,9 @@ void timer_init(void);
 void pmm_init(void);
 void mmu_init(void);
 void proc_init(void);
+int ramfb_init(uint32_t width, uint32_t height);
+void fb_fill(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t color);
+void fb_clear(uint32_t color);
 int proc_create(uint32_t num_pages, void (*entry)(void));
 void proc_grant_device(int pid, uint64_t device_pa);
 void proc_set_name(int pid, const char *name);
@@ -1755,6 +1758,15 @@ void main() {
   print("\n");
 
   proc_init();
+  print("\n");
+
+  print("setting up framebuffer\n");
+  if (ramfb_init(800, 600) == 0) {
+    // draw a test pattern — blue screen with a white rectangle
+    fb_clear(0x00334455);
+    fb_fill(100, 100, 600, 400, 0x00FFFFFF);
+    print("[main] framebuffer test pattern drawn\n");
+  }
   print("\n");
 
   print("creating tasks\n");
