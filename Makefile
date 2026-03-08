@@ -6,7 +6,7 @@ OBJCOPY = objcopy
 CFLAGS = -ffreestanding -nostdlib -O2 -Wall
 ASFLAGS = -c
 
-all: kernel.bin
+all: kernel8.img
 
 boot.o: boot.S
 	$(AS) $(ASFLAGS) boot.S -o boot.o
@@ -44,11 +44,8 @@ syscall.o: syscall.c
 kernel.elf: boot.o vectors.o main.o exception.o gic.o timer.o irq.o pmm.o mmu.o proc.o syscall.o linker.ld
 	$(LD) -T linker.ld boot.o vectors.o main.o exception.o gic.o timer.o irq.o pmm.o mmu.o proc.o syscall.o -o kernel.elf
 
-kernel.bin: kernel.elf
-	$(OBJCOPY) -O binary kernel.elf kernel.bin
-
-run: kernel.bin
-	qemu-system-aarch64 -M virt -cpu cortex-a72 -nographic -kernel kernel.bin
+kernel8.img: kernel.elf
+	$(OBJCOPY) -O binary kernel.elf kernel8.img
 
 clean:
-	rm -f *.o kernel.elf kernel.bin
+	rm -f *.o kernel.elf kernel8.img
