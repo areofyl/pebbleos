@@ -1,57 +1,23 @@
 # telOS
 
-a tiny aarch64 kernel i'm building from scratch for fun. no libc, no dependencies, just C and arm64 assembly running on QEMU virt.
+a tiny aarch64 SASOS kernel, written from scratch in C and ARM64 assembly. no libc, no dependencies — everything from `putchar` to the compiler runs on bare metal.
 
-it's a SASOS (Single Address Space OS) — all tasks share one set of page tables, and isolation is done by flipping permission bits on context switch instead of swapping page tables. weird but it works.
+SASOS = Single Address Space OS. all tasks share one set of page tables. instead of swapping page tables on context switch (expensive TLB flush), telOS flips AP permission bits so only the running task can touch its memory. simpler and faster.
 
-## what it can do
+runs on QEMU virt (cortex-a72). there's also an [rpi5 branch](https://github.com/areofyl/telos/tree/rpi5) targeting real hardware.
 
-- boots on qemu virt (cortex-a72), drops from EL2 to EL1
-- uart (PL011), full exception handling with register dumps
-- GIC + arm generic timer for preemptive round-robin scheduling
-- physical page allocator (bitmap, 4KB pages, 128MB)
-- MMU with 4KB granule, identity-mapped kernel, per-task slots
-- EL0 userspace with syscalls (svc #0)
-- IPC — synchronous message passing (send/recv/call/reply)
-- nameserver so tasks can find each other by name
-- tag-based filesystem (no directories — files have key:value tags)
-- interactive shell to poke around the filesystem
-- built-in C compiler (tcc) — JIT compiles a subset of C to aarch64 and runs it
-
-## the tag-based fs
-
-instead of directories, files have tags. you label things and query by tags:
+## demo
 
 ```
-telos> create notes.txt
-telos> write notes.txt some stuff i wrote
-telos> tag notes.txt type text
-telos> tag notes.txt topic ideas
-telos> query type text
-notes.txt
-log.txt
-telos> tags notes.txt
-  type = text
-  topic = ideas
-```
+  _       _  ___  ____
+ | |_ ___| |/ _ \/ ___|
+ | __/ _ \ | | | \___ \
+ | ||  __/ | |_| |___) |
+  \__\___|_|\___/|____/
 
-it's kind of like how you'd search for files if folders didn't exist. still figuring out where to take this but it's a fun model to play with.
+Type 'help' for commands.
+Try 'cat hello.c' then 'cc hello.c'
 
-## the C compiler
-
-there's a built-in C compiler (`cc` command) that JIT-compiles a subset of C directly to aarch64 machine code and runs it. no assembler, no linker — single-pass recursive descent that emits instructions into a buffer and jumps to it.
-
-```
-telos> cat hello.c
-int main() {
-  int i = 0;
-  while (i < 10) {
-    putc('0' + i);
-    putc('\n');
-    i = i + 1;
-  }
-  return 0;
-}
 telos> cc hello.c
 [cc] running...
 0
@@ -66,58 +32,103 @@ telos> cc hello.c
 9
 
 [cc] exit code: 0
+telos>
 ```
 
-supports: `int` variables, `if`/`else`, `while`, arithmetic (`+ - * / %`), comparisons, `&&`/`||`, `putc()`, `getc()`, char/int literals, `return`.
+## features
 
-## build
+**kernel**
+- EL2 → EL1 drop on boot, exception vectors, full fault dumps
+- GIC + ARM generic timer, preemptive round-robin scheduler
+- bitmap page allocator (4KB pages, 128MB)
+- MMU with 4KB granule, identity-mapped kernel, per-task VA slots
+- SASOS isolation via AP bit flipping + UXN on context switch
+- EL0 userspace with syscalls (`svc #0`)
+- synchronous IPC (send/recv/call/reply)
+
+**userspace**
+- UART server (PL011)
+- nameserver — tasks find each other by name, nothing hardcoded
+- tag-based filesystem — files have key:value tags instead of directories
+- shell (tsh) with ls, cat, create, write, tag, query, ps, top, telfetch
+- text editor (teled) — Ctrl+S to save, Ctrl+Q to quit
+- C compiler (tcc) — JIT compiles to aarch64 and runs it
+
+## the C compiler
+
+the `cc` command reads a source file, compiles it in a single pass (recursive descent), emits aarch64 machine code into a buffer, flushes icache, and calls it. no assembler, no linker, no ELF — just raw instructions.
 
 ```
-make
-make run
-make clean
+telos> teled fizzbuzz.c       // write your program
+telos> cc fizzbuzz.c          // compile and run
 ```
 
-needs `gcc` (aarch64 cross-compiler), `ld`, `objcopy`, `qemu-system-aarch64`
+**supported:** `int` variables, `if`/`else`, `while`, `return`, arithmetic (`+ - * / %`), comparisons (`< > <= >= == !=`), logical (`&& ||`), `putc()`, `getc()`, character and integer literals, `//` comments.
 
-exit qemu: `ctrl+a` then `x`
+## the tag-based filesystem
+
+no directories. files have tags:
+
+```
+telos> create notes.txt
+telos> write notes.txt remember to fix the scheduler
+telos> tag notes.txt type text
+telos> tag notes.txt topic kernel
+telos> query type text
+notes.txt
+telos> tags notes.txt
+  type = text
+  topic = kernel
+```
+
+## syscalls
+
+| # | name | args | description |
+|---|------|------|-------------|
+| 0 | write | buf, len | print to UART (len=0 for null-terminated) |
+| 1 | yield | | give up time slice |
+| 2 | exit | | kill current task |
+| 3 | send | pid, buf, len | send message (blocks if target not ready) |
+| 4 | recv | buf, max | receive message (blocks until message arrives) |
+| 5 | call | pid, buf, len, reply, rmax | send + wait for reply |
+| 6 | reply | pid, buf, len | reply to a blocked caller |
+| 7 | procinfo | buf, max | get running task info |
+| 8 | cacheflush | addr, len | flush dcache + invalidate icache (for JIT) |
 
 ## memory map
 
 | range | what |
 |-------|------|
-| `0x00000000-0x3fffffff` | device memory (UART, GIC, etc) |
-| `0x40000000-0x47ffffff` | RAM (identity mapped) |
+| `0x00000000-0x3fffffff` | device memory (UART, GIC, timer) |
+| `0x40000000-0x47ffffff` | RAM (128MB, identity mapped) |
 | `0x40080000` | kernel load address |
-| `0x80000000+` | process slots (16MB each, up to 8 tasks) |
+| `0x80000000+` | task slots (16MB each, up to 8) |
+
+## build
+
+```
+make          # build kernel.bin
+make run      # boot in QEMU
+make clean    # clean
+```
+
+needs an aarch64 gcc, ld, objcopy, and qemu-system-aarch64.
+
+exit qemu: `ctrl+a` then `x`
 
 ## files
 
 | file | what |
 |------|------|
-| `boot.S` | entry, EL2 drop, stack setup, bss zeroing |
-| `vectors.S` | vector table, save/restore macros, syscall + irq entry |
-| `main.c` | everything userspace — uart server, nameserver, fs, shell, compiler, tasks |
-| `exception.c` | exception handler (ESR/ELR/FAR dump) |
-| `gic.c` | GIC distributor + cpu interface |
-| `timer.c` | arm generic timer, 1s tick |
-| `irq.c` | irq dispatch + scheduler hook |
+| `boot.S` | entry point — EL2 drop, stack, FP/SIMD, BSS zeroing, vectors |
+| `vectors.S` | exception vector table, SAVE_ALL/RESTORE_ALL, svc/irq entry |
+| `main.c` | userspace: uart server, nameserver, fs server, shell, editor, compiler |
+| `exception.c` | fault handler with ESR/ELR/FAR dump |
+| `gic.c` | GIC distributor + CPU interface |
+| `timer.c` | ARM generic timer (1s periodic tick) |
+| `irq.c` | IRQ dispatch, scheduler hook |
 | `pmm.c` | bitmap page allocator |
-| `mmu.c` | page tables, map/unmap, permission toggling, device mapping |
-| `proc.c` | process slots, scheduler, context switch |
-| `syscall.c` | syscall dispatch (write, yield, exit, send, recv, call, reply, cacheflush) |
-| `linker.ld` | memory layout |
-
-## how it works
-
-tasks run at EL0. they `svc #0` to make syscalls — handled at EL1. every timer tick, the scheduler saves the current task's state, picks the next one, flips page permissions so only the active task can touch its memory, and restores.
-
-each task gets a 16MB slot starting at 0x80000000. the kernel maps code + stack pages there and controls access with AP bits — running task gets EL0 rw, everyone else EL1-only.
-
-IPC is synchronous: `sys_call` sends a message and blocks until the server replies. servers loop on `sys_recv` waiting for requests. the nameserver (pid 1) lets tasks register names and look each other up, so nothing is hardcoded.
-
-the fs server stores files in memory with tags instead of a directory tree. the shell talks directly to UART for input and uses IPC to talk to the fs server.
-
-## what's next
-
-not sure yet, just seeing where this goes. maybe pipes, maybe spawning tasks from the shell, maybe porting to a raspberry pi, maybe something else entirely.
+| `mmu.c` | page tables, map/unmap/set_page_flags |
+| `proc.c` | task slots, round-robin scheduler, AP bit toggling, IPC |
+| `syscall.c` | syscall dispatch |
+| `linker.ld` | memory layout (kernel at 0x40080000) |
