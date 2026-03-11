@@ -1986,6 +1986,43 @@ void shell_task(uint64_t uart_base) {
   }
 }
 
+// ---- multicore (SMP) ----
+
+// PSCI CPU_ON — ask firmware to start a secondary core
+// target_cpu = MPIDR affinity value (just core number on RPi 5)
+// entry = address the core starts executing at
+// SMC because RPi 5 uses ARM Trusted Firmware for PSCI
+static int psci_cpu_on(uint64_t target_cpu, uint64_t entry_point) {
+    register uint64_t x0 asm("x0") = 0xC4000003;  // CPU_ON function ID (SMC64)
+    register uint64_t x1 asm("x1") = target_cpu;
+    register uint64_t x2 asm("x2") = entry_point;
+    register uint64_t x3 asm("x3") = 0;            // context_id (unused)
+
+    asm volatile("smc #0"
+        : "+r"(x0)
+        : "r"(x1), "r"(x2), "r"(x3)
+        : "memory");
+
+    return (int)x0;
+}
+
+// entry point for secondary cores (called from boot.S secondary_entry)
+extern void secondary_entry(void);
+void mmu_init_secondary(void);
+
+void secondary_main(uint64_t core_id) {
+    // enable MMU — reuses core 0's page tables
+    mmu_init_secondary();
+
+    print("[smp] core ");
+    print_hex(core_id);
+    print(" alive\n");
+
+    // idle for now — step 2 will add GIC + timer + scheduling
+    for (;;)
+        asm volatile("wfe");
+}
+
 // ---- entry point ----
 
 void main() {
@@ -2007,6 +2044,22 @@ void main() {
   print("\n");
 
   proc_init();
+  print("\n");
+
+  // bring up secondary cores via PSCI
+  print("waking secondary cores\n");
+  for (int i = 1; i < 4; i++) {
+    int ret = psci_cpu_on((uint64_t)i, (uint64_t)secondary_entry);
+    print("[smp] core ");
+    print_hex(i);
+    if (ret == 0)
+      print(" started\n");
+    else {
+      print(" failed (");
+      print_hex(ret);
+      print(")\n");
+    }
+  }
   print("\n");
 
   print("creating tasks\n");
