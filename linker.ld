@@ -29,7 +29,14 @@ SECTIONS
 
   . = ALIGN(16);
   . = . + 4096;
-  _stack_top = .;
+  _stack_top = .;         /* core 0 */
+
+  . = . + 4096;
+  _stack_top_core1 = .;   /* core 1 */
+  . = . + 4096;
+  _stack_top_core2 = .;   /* core 2 */
+  . = . + 4096;
+  _stack_top_core3 = .;   /* core 3 */
 
   /* everything after this is free ram for the allocator */
   . = ALIGN(4096);
