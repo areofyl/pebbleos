@@ -22,7 +22,13 @@ uint64_t irq_handler(uint64_t frame) {
         return frame;
 
     if (intid == 30) {
-        tick_count++;
+        // only core 0 bumps the global tick counter
+        // (all cores get their own timer IRQ 30, but tick_count is just for display)
+        uint64_t mpidr;
+        asm volatile("mrs %0, mpidr_el1" : "=r"(mpidr));
+        if ((mpidr & 3) == 0)
+            tick_count++;
+
         timer_reset();
 
         // let the scheduler decide if we should switch
