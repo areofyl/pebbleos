@@ -150,6 +150,38 @@ void set_page_flags(uint64_t va, uint64_t flags) {
     tlb_flush_va(va);
 }
 
+// secondary cores reuse the same page tables but need their own system registers
+// MAIR, TCR, TTBR0, SCTLR are all per-core — each core has its own copy
+void mmu_init_secondary(void) {
+    uint64_t mair = (0x00UL << (MT_DEVICE * 8))
+                  | (0xFFUL << (MT_NORMAL * 8));
+    asm volatile("msr mair_el1, %0" : : "r"(mair));
+
+    uint64_t tcr = (25UL << 0)
+                 | (0b00UL << 14)
+                 | (0b11UL << 12)
+                 | (0b01UL << 10)
+                 | (0b01UL << 8)
+                 | (0b010UL << 32);
+    asm volatile("msr tcr_el1, %0" : : "r"(tcr));
+
+    // point at the SAME L1 table that core 0 built
+    asm volatile("msr ttbr0_el1, %0" : : "r"((uint64_t)l1_table));
+
+    asm volatile("tlbi vmalle1");
+    asm volatile("dsb sy");
+    asm volatile("isb");
+    asm volatile("ic iallu");
+    asm volatile("dsb sy");
+    asm volatile("isb");
+
+    uint64_t sctlr;
+    asm volatile("mrs %0, sctlr_el1" : "=r"(sctlr));
+    sctlr |= (1 << 0) | (1 << 2) | (1 << 12);
+    asm volatile("msr sctlr_el1, %0" : : "r"(sctlr));
+    asm volatile("isb");
+}
+
 void mmu_init(void) {
     print("[mmu] setting up page tables\n");
 
