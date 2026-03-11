@@ -45,6 +45,18 @@ void gic_init(void) {
   print("[gic] IRQ 30 (timer) enabled\n");
 }
 
+// per-core GIC setup — secondary cores need their own cpu interface
+// the distributor is shared and already enabled by core 0
+// but GICC (cpu interface) is per-core, and PPI enables (IRQs 0-31)
+// in ISENABLER0 are banked per-core in the GIC
+void gic_init_percpu(void) {
+  GICC_CTLR = 1;
+  GICC_PMR = 0xFF;
+
+  // enable IRQ 30 (timer PPI) — banked, so this only affects this core
+  GICD_ISENABLER0 = (1 << 30);
+}
+
 // read GICC_IAR to find out which interrupt fired
 // also acknowledges it. 1023 = spurious
 uint32_t gic_ack(void) { return GICC_IAR; }
