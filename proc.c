@@ -4,9 +4,46 @@
 // every process gets a fixed VA region in the single address space
 // isolation = flipping AP bits on context switch
 // scheduling = round robin on timer tick, stack swap
+// multi-core: per-core current_pid, spinlock on proc table
 
 void print(const char *s);
 void print_hex(unsigned long val);
+
+// ---- spinlock (ARMv8 exclusive monitor) ----
+
+typedef struct { volatile uint32_t lock; } spinlock_t;
+
+static inline void spin_lock(spinlock_t *lk) {
+    uint32_t tmp;
+    asm volatile(
+        "1: ldaxr %w0, [%1]\n"     // load-acquire exclusive
+        "   cbnz  %w0, 1b\n"       // if locked, retry
+        "   stxr  %w0, %w2, [%1]\n" // try to store 1
+        "   cbnz  %w0, 1b\n"       // if store failed, retry
+        : "=&r"(tmp) : "r"(&lk->lock), "r"(1) : "memory"
+    );
+}
+
+static inline void spin_unlock(spinlock_t *lk) {
+    asm volatile("stlr wzr, [%0]" : : "r"(&lk->lock) : "memory");
+}
+
+// ---- per-core state ----
+
+#define MAX_CORES 4
+
+static inline uint32_t cpu_id(void) {
+    uint64_t mpidr;
+    asm volatile("mrs %0, mpidr_el1" : "=r"(mpidr));
+    return mpidr & 3;
+}
+
+// each core tracks which task it's running and its idle frame
+static int current_pid_per_core[MAX_CORES] = { -1, -1, -1, -1 };
+static uint64_t idle_sp_per_core[MAX_CORES];
+
+// global lock protecting procs[] and scheduler state
+static spinlock_t sched_lock = { 0 };
 uint64_t alloc_page(void);
 void free_page(uint64_t addr);
 void map_page(uint64_t va, uint64_t pa, uint64_t flags);
@@ -66,13 +103,12 @@ typedef struct {
 } proc_t;
 
 static proc_t procs[MAX_PROCS];
-static int current_pid = -1;
-static uint64_t idle_sp;
 
 void proc_init(void) {
     for (int i = 0; i < MAX_PROCS; i++)
         procs[i].state = PROC_UNUSED;
-    current_pid = -1;
+    for (int i = 0; i < MAX_CORES; i++)
+        current_pid_per_core[i] = -1;
     print("[proc] initialized\n");
 }
 
@@ -161,6 +197,7 @@ int proc_create(uint32_t num_pages, void (*entry)(void)) {
 
 // forward declarations
 void proc_set_name(int pid, const char *name);
+static uint64_t *schedule_locked(uint64_t *frame);
 
 // device memory attributes: attr index 0 (device-nGnRnE), no shareability
 #define FLAGS_DEVICE 0
@@ -289,8 +326,12 @@ int proc_spawn(void *code_buf, uint32_t code_len, const char *name, uint64_t dev
 // kill the currently running task
 // called from syscall handler on sys_exit or user fault
 void proc_exit_current(void) {
-    if (current_pid < 0) return;
-    proc_destroy(current_pid);
+    int core = cpu_id();
+    int pid = current_pid_per_core[core];
+    if (pid < 0) return;
+    spin_lock(&sched_lock);
+    proc_destroy(pid);
+    spin_unlock(&sched_lock);
     // dont update current_pid here, schedule will handle it
 }
 
@@ -300,24 +341,28 @@ uint64_t proc_get_base(int pid) {
     return procs[pid].slot_base;
 }
 
-// round robin scheduler
+// round robin scheduler — per-core
 // saves current task's frame, picks next, returns that task's frame
-uint64_t *schedule(uint64_t *frame) {
-    if (current_pid >= 0) {
-        if (procs[current_pid].state == PROC_RUNNING) {
+// CALLER must hold sched_lock
+static uint64_t *schedule_locked(uint64_t *frame) {
+    int core = cpu_id();
+    int cur = current_pid_per_core[core];
+
+    if (cur >= 0) {
+        if (procs[cur].state == PROC_RUNNING) {
             // still alive, just preempted
-            procs[current_pid].saved_sp = (uint64_t)frame;
-            procs[current_pid].state = PROC_READY;
-            proc_protect(current_pid);
+            procs[cur].saved_sp = (uint64_t)frame;
+            procs[cur].state = PROC_READY;
+            proc_protect(cur);
         }
         // if state is PROC_UNUSED, it was killed (sys_exit), dont save
     } else {
-        idle_sp = (uint64_t)frame;
+        idle_sp_per_core[core] = (uint64_t)frame;
     }
 
-    // find next ready task
+    // find next ready task (skip tasks running on other cores)
     int next = -1;
-    int start = (current_pid < 0) ? 0 : current_pid + 1;
+    int start = (cur < 0) ? 0 : cur + 1;
     for (int i = 0; i < MAX_PROCS; i++) {
         int idx = (start + i) % MAX_PROCS;
         if (procs[idx].state == PROC_READY) {
@@ -327,19 +372,27 @@ uint64_t *schedule(uint64_t *frame) {
     }
 
     if (next < 0) {
-        current_pid = -1;
-        return (uint64_t *)idle_sp;
+        current_pid_per_core[core] = -1;
+        return (uint64_t *)idle_sp_per_core[core];
     }
 
     proc_unprotect(next);
     procs[next].state = PROC_RUNNING;
-    current_pid = next;
+    current_pid_per_core[core] = next;
 
     return (uint64_t *)procs[next].saved_sp;
 }
 
+// public schedule: acquires lock, calls scheduler, releases lock
+uint64_t *schedule(uint64_t *frame) {
+    spin_lock(&sched_lock);
+    uint64_t *ret = schedule_locked(frame);
+    spin_unlock(&sched_lock);
+    return ret;
+}
+
 int proc_current_pid_get(void) {
-    return current_pid;
+    return current_pid_per_core[cpu_id()];
 }
 
 // find a task that's BLOCKED_SEND targeting this pid
@@ -361,8 +414,9 @@ static void ipc_copy(uint64_t dst, uint64_t src, uint32_t len) {
 
 // send a message to target — blocks if target isn't waiting
 // returns new frame pointer (may reschedule)
-uint64_t *ipc_send(uint64_t *frame, int target, uint64_t msg_ptr, uint32_t len) {
-    int sender = current_pid;
+// internal send — caller must hold sched_lock
+static uint64_t *ipc_send_locked(uint64_t *frame, int target, uint64_t msg_ptr, uint32_t len) {
+    int sender = current_pid_per_core[cpu_id()];
 
     // validate target
     if (target < 0 || target >= MAX_PROCS ||
@@ -393,7 +447,7 @@ uint64_t *ipc_send(uint64_t *frame, int target, uint64_t msg_ptr, uint32_t len) 
             procs[sender].saved_sp = (uint64_t)frame;
             procs[sender].state = PROC_BLOCKED_REPLY;
             proc_protect(sender);
-            return schedule(frame);
+            return schedule_locked(frame);
         }
 
         // sender continues immediately
@@ -409,13 +463,22 @@ uint64_t *ipc_send(uint64_t *frame, int target, uint64_t msg_ptr, uint32_t len) 
     procs[sender].state = PROC_BLOCKED_SEND;
     proc_protect(sender);
 
-    return schedule(frame);
+    return schedule_locked(frame);
+}
+
+// public send: acquires lock, calls internal send, releases lock
+uint64_t *ipc_send(uint64_t *frame, int target, uint64_t msg_ptr, uint32_t len) {
+    spin_lock(&sched_lock);
+    uint64_t *ret = ipc_send_locked(frame, target, msg_ptr, len);
+    spin_unlock(&sched_lock);
+    return ret;
 }
 
 // receive a message — blocks if nobody is sending to us
 // returns new frame pointer (may reschedule)
 uint64_t *ipc_recv(uint64_t *frame, uint64_t buf_ptr, uint32_t max_len) {
-    int receiver = current_pid;
+    spin_lock(&sched_lock);
+    int receiver = current_pid_per_core[cpu_id()];
 
     // check if anyone is already trying to send to us
     int sender = find_sender(receiver);
@@ -443,6 +506,7 @@ uint64_t *ipc_recv(uint64_t *frame, uint64_t buf_ptr, uint32_t max_len) {
         // receiver continues: x0 = sender pid, x1 = bytes copied
         frame[FRAME_X0] = (uint64_t)sender;
         frame[FRAME_X1] = (uint64_t)copy_len;
+        spin_unlock(&sched_lock);
         return frame;
     }
 
@@ -453,17 +517,22 @@ uint64_t *ipc_recv(uint64_t *frame, uint64_t buf_ptr, uint32_t max_len) {
     procs[receiver].state = PROC_BLOCKED_RECV;
     proc_protect(receiver);
 
-    return schedule(frame);
+    uint64_t *ret = schedule_locked(frame);
+    spin_unlock(&sched_lock);
+    return ret;
 }
 
 // send a message and block waiting for a reply
 uint64_t *ipc_call(uint64_t *frame, int target, uint64_t msg_ptr, uint32_t len,
                    uint64_t reply_buf, uint32_t reply_max) {
-    int sender = current_pid;
+    spin_lock(&sched_lock);
+    int sender = current_pid_per_core[cpu_id()];
     procs[sender].wants_reply = 1;
     procs[sender].reply_buf = reply_buf;
     procs[sender].reply_max = reply_max;
-    return ipc_send(frame, target, msg_ptr, len);
+    uint64_t *ret = ipc_send_locked(frame, target, msg_ptr, len);
+    spin_unlock(&sched_lock);
+    return ret;
 }
 
 void proc_set_name(int pid, const char *name) {
@@ -496,9 +565,12 @@ uint64_t proc_get_info(char *buf, uint64_t max) {
 
 // reply to a caller blocked in BLOCKED_REPLY
 uint64_t *ipc_reply(uint64_t *frame, int target, uint64_t msg_ptr, uint32_t len) {
+    spin_lock(&sched_lock);
+
     if (target < 0 || target >= MAX_PROCS ||
         procs[target].state != PROC_BLOCKED_REPLY) {
         frame[FRAME_X0] = (uint64_t)-1;
+        spin_unlock(&sched_lock);
         return frame;
     }
 
@@ -518,5 +590,6 @@ uint64_t *ipc_reply(uint64_t *frame, int target, uint64_t msg_ptr, uint32_t len)
 
     // replier continues immediately
     frame[FRAME_X0] = 0;
+    spin_unlock(&sched_lock);
     return frame;
 }
